@@ -58,7 +58,7 @@ MAX_CONSECUTIVE_500_ERRORS = int(os.getenv("MAX_CONSECUTIVE_500_ERRORS", 10)) # 
 INFLUXDB_ENDPOINT_IS_HTTP = False if os.getenv("INFLUXDB_ENDPOINT_IS_HTTP") in ['False','false','FALSE','f','F','no','No','NO','0'] else True # optional
 GARMIN_DEVICENAME_AUTOMATIC = False if GARMIN_DEVICENAME != "Unknown" else True # optional
 UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", 300)) # optional
-FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity which you can add to the list seperated by , without any space
+FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle,weather") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity which you can add to the list seperated by , without any space
 ACTIVITY_TYPE_FILTER = [t.strip().lower() for t in os.getenv("ACTIVITY_TYPE_FILTER", "").split(",") if t.strip()] # optional, comma-separated list of activity typeKeys to import only specific activity types. Leave empty to import all. Known typeKeys: running,treadmill_running,indoor_running,cycling,indoor_cycling,road_biking,mountain_biking,walking,hiking,mountaineering,strength_training,hiit,indoor_cardio,elliptical,lap_swimming,open_water_swimming,rock_climbing,indoor_climbing,tennis_v2,kayaking_v2,boating_v2,multi_sport,other
 LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").upper().split(",") # Garmin currently implements RUNNING, but has provisions for CYCLING, and SWIMMING
 KEEP_FIT_FILES = True if os.getenv("KEEP_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional
@@ -694,6 +694,7 @@ def get_activity_summary(date_str):
     points_list = []
     activity_with_gps_id_dict = {}
     strength_activity_id_dict = {}
+    activity_weather_info = []
     activity_list = garmin_obj.get_activities_by_date(date_str, date_str)
     if ACTIVITY_TYPE_FILTER:
         activity_list = [a for a in activity_list if (a.get('activityType') or {}).get('typeKey', 'Unknown').lower() in ACTIVITY_TYPE_FILTER]
@@ -704,6 +705,17 @@ def get_activity_summary(date_str):
             if not activity.get('hasPolyline'):
                 logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as ALWAYS_PROCESS_FIT_FILES is on")
             activity_with_gps_id_dict[activity.get('activityId')] = activity_type_key
+            # Capture start location for weather enrichment
+            _start_lat = activity.get('startLatitude') or activity.get('beginLatitude')
+            _start_lon = activity.get('startLongitude') or activity.get('beginLongitude')
+            if _start_lat and _start_lon:
+                _sel = datetime.strptime(activity["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC).strftime('%Y%m%dT%H%M%SUTC-') + activity_type_key
+                activity_weather_info.append({
+                    "selector": _sel,
+                    "start_time_utc": datetime.strptime(activity["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC).isoformat(),
+                    "lat": float(_start_lat),
+                    "lon": float(_start_lon),
+                })
         # Collect strength training activities for API-based exercise set fetching
         if 'strength' in activity_type_key.lower() and activity.get('startTimeGMT'):
             strength_activity_id_dict[activity.get('activityId')] = {
@@ -787,7 +799,7 @@ def get_activity_summary(date_str):
             logging.info(f"Success : Fetching Activity summary with id {activity.get('activityId')} for date {date_str}")
         else:
             logging.warning(f"Skipped : Start Timestamp missing for activity id {activity.get('activityId')} for date {date_str}")
-    return points_list, activity_with_gps_id_dict, strength_activity_id_dict
+    return points_list, activity_with_gps_id_dict, strength_activity_id_dict, activity_weather_info
 
 # %%
 def get_strength_training_data(strength_activity_id_dict):
@@ -882,6 +894,123 @@ def get_strength_training_data(strength_activity_id_dict):
     return points_list
 
 # %%
+
+# %%
+# --- Weather enrichment (Open-Meteo Archive API) ---
+OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_HOURLY_VARS = "temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,wind_speed_10m,wind_gusts_10m,wind_direction_10m,precipitation,cloud_cover,pressure_msl,shortwave_radiation"
+
+import math as _math
+
+def _compute_wbgt(temp_c, humidity_pct):
+    """Simplified outdoor WBGT estimate (Liljegren approximation, no globe thermometer)."""
+    e = (humidity_pct / 100.0) * 6.105 * _math.exp(17.27 * temp_c / (237.7 + temp_c))
+    return round(0.567 * temp_c + 0.393 * e + 3.94, 1)
+
+
+def fetch_activity_weather(activity_info_list):
+    """
+    Fetch weather from Open-Meteo for each outdoor activity and return InfluxDB points.
+
+    Parameters
+    ----------
+    activity_info_list : list of dict
+        Each dict has: selector (ActivitySelector tag), start_time_utc (ISO str),
+        lat (float), lon (float).
+
+    Returns
+    -------
+    list of InfluxDB point dicts (measurement=ActivityWeather).
+    """
+    points_list = []
+    for info in activity_info_list:
+        selector = info["selector"]
+        lat = info.get("lat")
+        lon = info.get("lon")
+        start_iso = info["start_time_utc"]
+
+        if not lat or not lon:
+            logging.debug(f"Weather: no GPS for {selector}, skipping")
+            continue
+
+        try:
+            start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        except Exception:
+            logging.warning(f"Weather: bad timestamp for {selector}: {start_iso}")
+            continue
+
+        date_str = start_dt.strftime("%Y-%m-%d")
+        hour_str = start_dt.strftime("%Y-%m-%dT%H:00")
+
+        try:
+            resp = requests.get(OPEN_METEO_URL, params={
+                "latitude": round(lat, 4),
+                "longitude": round(lon, 4),
+                "start_date": date_str,
+                "end_date": date_str,
+                "hourly": OPEN_METEO_HOURLY_VARS,
+                "timezone": "UTC",
+            }, timeout=30)
+            resp.raise_for_status()
+            weather = resp.json()
+        except Exception as exc:
+            logging.warning(f"Weather: Open-Meteo API error for {selector}: {exc}")
+            continue
+
+        hourly = weather.get("hourly", {})
+        times = hourly.get("time", [])
+        idx = times.index(hour_str) if hour_str in times else 0 if times else None
+        if idx is None:
+            logging.warning(f"Weather: no hourly data for {selector}")
+            continue
+
+        def _val(key):
+            arr = hourly.get(key, [])
+            return float(arr[idx]) if idx < len(arr) and arr[idx] is not None else None
+
+        temp = _val("temperature_2m")
+        humidity = _val("relative_humidity_2m")
+
+        fields = {}
+        field_map = {
+            "temperature_c": "temperature_2m",
+            "humidity_pct": "relative_humidity_2m",
+            "dew_point_c": "dew_point_2m",
+            "apparent_temp_c": "apparent_temperature",
+            "wind_speed_kmh": "wind_speed_10m",
+            "wind_gust_kmh": "wind_gusts_10m",
+            "wind_direction_deg": "wind_direction_10m",
+            "precipitation_mm": "precipitation",
+            "cloud_cover_pct": "cloud_cover",
+            "pressure_hpa": "pressure_msl",
+            "solar_radiation_wm2": "shortwave_radiation",
+        }
+        for field_name, api_key in field_map.items():
+            v = _val(api_key)
+            if v is not None:
+                fields[field_name] = v
+
+        if temp is not None and humidity is not None:
+            fields["wbgt_estimated"] = float(_compute_wbgt(temp, humidity))
+
+        if not fields:
+            continue
+
+        points_list.append({
+            "measurement": "ActivityWeather",
+            "time": start_iso,
+            "tags": {
+                "ActivitySelector": selector,
+                "Device": GARMIN_DEVICENAME,
+                "Database_Name": INFLUXDB_DATABASE,
+            },
+            "fields": fields,
+        })
+        logging.info(f"Weather: {selector} -> {temp}°C, {humidity}% humidity, WBGT {fields.get('wbgt_estimated', '?')}")
+
+    return points_list
+
+
 def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back to TCX
     points_list = []
     for activityID in activityIDdict.keys():
@@ -2019,11 +2148,16 @@ def daily_fetch_write(date_str):
     if 'hydration' in FETCH_SELECTION:
         write_points_to_influxdb(get_hydration(date_str))
     if 'activity' in FETCH_SELECTION:
-        activity_summary_points_list, activity_with_gps_id_dict, strength_activity_id_dict = get_activity_summary(date_str)
+        activity_summary_points_list, activity_with_gps_id_dict, strength_activity_id_dict, activity_weather_info = get_activity_summary(date_str)
         write_points_to_influxdb(activity_summary_points_list)
         write_points_to_influxdb(fetch_activity_GPS(activity_with_gps_id_dict))
         if strength_activity_id_dict:
             write_points_to_influxdb(get_strength_training_data(strength_activity_id_dict))
+        if 'weather' in FETCH_SELECTION and activity_weather_info:
+            weather_points = fetch_activity_weather(activity_weather_info)
+            if weather_points:
+                write_points_to_influxdb(weather_points)
+
     if 'solar_intensity' in FETCH_SELECTION:
         write_points_to_influxdb(get_solar_intensity(date_str))
     if 'lifestyle' in FETCH_SELECTION:
