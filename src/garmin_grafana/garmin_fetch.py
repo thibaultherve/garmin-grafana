@@ -35,7 +35,7 @@ if env_override:
 # %%
 INFLUXDB_VERSION = os.getenv("INFLUXDB_VERSION",'1') # Your influxdb database version (accepted values are '1' or '3')
 assert INFLUXDB_VERSION in ['1','3'], "Only InfluxDB version 1 or 3 is allowed - please ensure to set this value to either 1 or 3"
-INFLUXDB_HOST = os.getenv("INFLUXDB_HOST",'localhost') # Required
+INFLUXDB_HOST = os.getenv("INFLUXDB_HOST",'your.influxdb.hostname') # Required
 INFLUXDB_PORT = int(os.getenv("INFLUXDB_PORT", 8086)) # Required
 INFLUXDB_USERNAME = os.getenv("INFLUXDB_USERNAME", 'influxdb_username') # Required
 INFLUXDB_PASSWORD = os.getenv("INFLUXDB_PASSWORD", 'influxdb_access_password') # Required
@@ -43,9 +43,8 @@ INFLUXDB_DATABASE = os.getenv("INFLUXDB_DATABASE", 'GarminStats') # Required
 INFLUXDB_V3_ACCESS_TOKEN = os.getenv("INFLUXDB_V3_ACCESS_TOKEN",'') # InfluxDB V3 Access token, required only for InfluxDB V3
 INFLUXDB_ORG = os.getenv("INFLUXDB_ORG", 'default') # required only for InfluxDB V3 
 TOKEN_DIR = os.getenv("TOKEN_DIR", "~/.garminconnect") # optional
-GARMINCONNECT_EMAIL = (os.environ.get("GARMINCONNECT_EMAIL") or "").strip() or None # optional, asks in prompt on run if not provided
-_garmin_pw_b64 = os.getenv("GARMINCONNECT_BASE64_PASSWORD")
-GARMINCONNECT_PASSWORD = base64.b64decode(_garmin_pw_b64).decode("utf-8").strip() if _garmin_pw_b64 else None # optional, asks in prompt on run if not provided
+GARMINCONNECT_EMAIL = os.environ.get("GARMINCONNECT_EMAIL", None) # optional, asks in prompt on run if not provided
+GARMINCONNECT_PASSWORD = base64.b64decode(os.getenv("GARMINCONNECT_BASE64_PASSWORD")).decode("utf-8") if os.getenv("GARMINCONNECT_BASE64_PASSWORD") != None else None # optional, asks in prompt on run if not provided
 GARMINCONNECT_IS_CN = True if os.getenv("GARMINCONNECT_IS_CN") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional if you are using a Chinese account
 GARMIN_DEVICENAME = os.getenv("GARMIN_DEVICENAME", "Unknown")  # optional, attempts to set the name automatically if not given
 GARMIN_DEVICEID = os.getenv("GARMIN_DEVICEID", None)  # optional, attempts to set the id automatically if not given
@@ -59,7 +58,7 @@ MAX_CONSECUTIVE_500_ERRORS = int(os.getenv("MAX_CONSECUTIVE_500_ERRORS", 10)) # 
 INFLUXDB_ENDPOINT_IS_HTTP = False if os.getenv("INFLUXDB_ENDPOINT_IS_HTTP") in ['False','false','FALSE','f','F','no','No','NO','0'] else True # optional
 GARMIN_DEVICENAME_AUTOMATIC = False if GARMIN_DEVICENAME != "Unknown" else True # optional
 UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", 300)) # optional
-FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity,cycling_dynamics which you can add to the list seperated by , without any space
+FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity which you can add to the list seperated by , without any space
 ACTIVITY_TYPE_FILTER = [t.strip().lower() for t in os.getenv("ACTIVITY_TYPE_FILTER", "").split(",") if t.strip()] # optional, comma-separated list of activity typeKeys to import only specific activity types. Leave empty to import all. Known typeKeys: running,treadmill_running,indoor_running,cycling,indoor_cycling,road_biking,mountain_biking,walking,hiking,mountaineering,strength_training,hiit,indoor_cardio,elliptical,lap_swimming,open_water_swimming,rock_climbing,indoor_climbing,tennis_v2,kayaking_v2,boating_v2,multi_sport,other
 LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").upper().split(",") # Garmin currently implements RUNNING, but has provisions for CYCLING, and SWIMMING
 KEEP_FIT_FILES = True if os.getenv("KEEP_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional
@@ -137,8 +136,8 @@ def iter_days(start_date: str, end_date: str):
 
 # %%
 def garmin_login():
+    token_store = TOKEN_DIR
     token_store_expanded = os.path.expanduser(TOKEN_DIR)
-    token_store = token_store_expanded
     if os.path.isfile(token_store_expanded) and (not token_store_expanded.endswith('.json')):
         # New native client treats non-.json token paths as directories.
         # If a legacy file exists at this path, use a dedicated directory instead.
@@ -152,19 +151,32 @@ def garmin_login():
     try:
         logging.info(f"Trying to login to Garmin Connect using token data from '{token_store}'...")
         garmin = Garmin()
-        garmin.login(token_store)
+        result1, result2 = garmin.login(token_store)
+        if result1 == "needs_mfa":
+            raise GarminConnectAuthenticationError(
+                "MFA is required but credentials are not configured for interactive login"
+            )
         logging.info("Login to Garmin Connect successful using stored session tokens.")
 
     except (FileNotFoundError, GarminConnectAuthenticationError, GarminConnectConnectionError):
         logging.warning("Session is expired or login information not present/incorrect. You'll need to log in again...login with your Garmin Connect credentials to generate them.")
         try:
-            user_email = (GARMINCONNECT_EMAIL or "").strip() or input("Enter Garminconnect Login e-mail: ").strip()
-            user_password = (GARMINCONNECT_PASSWORD or "").strip() or input("Enter Garminconnect password (characters will be visible): ").strip()
+            user_email = GARMINCONNECT_EMAIL or input("Enter Garminconnect Login e-mail: ")
+            user_password = GARMINCONNECT_PASSWORD or input("Enter Garminconnect password (characters will be visible): ")
             garmin = Garmin(
-                email=user_email, password=user_password, is_cn=GARMINCONNECT_IS_CN,
-                prompt_mfa=lambda: input("MFA one-time code (via email or SMS): ").strip(),
+                email=user_email, password=user_password, is_cn=GARMINCONNECT_IS_CN, return_on_mfa=True
             )
-            garmin.login(token_store)
+            result1, result2 = garmin.login(token_store)
+            if result1 == "needs_mfa":  # MFA is required
+                mfa_code = input("MFA one-time code (via email or SMS): ")
+                garmin.resume_login(result2, mfa_code)
+
+            # With return_on_mfa=True, library login can return before its internal token auto-dump path.
+            # Persist tokens explicitly so next run can restore from TOKEN_DIR.
+            if hasattr(garmin, "client") and hasattr(garmin.client, "dump"):
+                garmin.client.dump(token_store)
+            else:
+                raise GarminConnectConnectionError("Unable to persist Garmin session tokens: no supported dump method found")
 
             logging.info(f"Oauth tokens stored in '{token_store}' for future use")
             logging.info("login to Garmin Connect successful using credentials and MFA (if enabled). Continuing with current run")
@@ -197,7 +209,7 @@ def write_points_to_influxdb(points):
         if len(points) != 0:
             if TAG_MEASUREMENTS_WITH_USER_EMAIL:
                 for item in points:
-                    item['tags'].update({'User_ID': garmin_obj.display_name or 'Unknown'})
+                    item['tags'].update({'User_ID': garmin_obj.client.profile.get('userName','Unknown')})
             # Write in chunks - Issue reported for large activities data containing >20000 points - Error 413 : payload too large
             for i in range(0, len(points), write_chunk_size):
                 if INFLUXDB_VERSION == '1':
@@ -599,7 +611,8 @@ def get_intraday_br(date_str):
 # %%
 def get_intraday_hrv(date_str):
     points_list = []
-    hrv_list = (garmin_obj.get_hrv_data(date_str) or {}).get('hrvReadings') or []
+    hrv_data = garmin_obj.get_hrv_data(date_str) or {}
+    hrv_list = hrv_data.get('hrvReadings') or []
     for entry in hrv_list:
         if entry.get('hrvValue'):
             points_list.append({
@@ -615,6 +628,32 @@ def get_intraday_hrv(date_str):
                 })
     if points_list:
         logging.info(f"Success : Fetching intraday HRV for date {date_str}")
+
+    # --- HRV Status summary (weeklyAvg, baseline band, status) ---
+    hrv_summary = hrv_data.get('hrvSummary')
+    if hrv_summary and hrv_summary.get('calendarDate'):
+        baseline = hrv_summary.get('baseline') or {}
+        hrv_status_fields = {
+            'weeklyAvg': hrv_summary.get('weeklyAvg'),
+            'lastNightAvg': hrv_summary.get('lastNightAvg'),
+            'lastNight5MinHigh': hrv_summary.get('lastNight5MinHigh'),
+            'baselineLowUpper': baseline.get('lowUpper'),
+            'baselineBalancedLow': baseline.get('balancedLow'),
+            'baselineBalancedUpper': baseline.get('balancedUpper'),
+            'status': hrv_summary.get('status'),
+        }
+        if any(v is not None for v in hrv_status_fields.values()):
+            points_list.append({
+                'measurement': 'HRVStatus',
+                'time': datetime.strptime(hrv_summary['calendarDate'], '%Y-%m-%d').replace(hour=0, tzinfo=pytz.UTC).isoformat(),
+                'tags': {
+                    'Device': GARMIN_DEVICENAME,
+                    'Database_Name': INFLUXDB_DATABASE
+                },
+                'fields': hrv_status_fields
+            })
+            logging.info(f'Success : Fetching HRV Status for date {date_str}')
+
     return points_list
 
 # %%
@@ -724,6 +763,7 @@ def get_activity_summary(date_str):
                     'aerobicTrainingEffect': activity.get('aerobicTrainingEffect'),
                     'anaerobicTrainingEffect': activity.get('anaerobicTrainingEffect'),
                     'activityTrainingLoad': activity.get('activityTrainingLoad'),
+                    'trainingEffectLabel': activity.get('trainingEffectLabel'),
                     'moderateIntensityMinutes': activity.get('moderateIntensityMinutes'),
                     'vigorousIntensityMinutes': activity.get('vigorousIntensityMinutes'),
                 }
@@ -750,42 +790,6 @@ def get_activity_summary(date_str):
     return points_list, activity_with_gps_id_dict, strength_activity_id_dict
 
 # %%
-def purge_existing_strength_exercise_sets(activity_id):
-    """Delete stale strength rows before rewriting the current Garmin snapshot.
-
-    Edited Garmin exercises can change exercise tags. Without removing the
-    previous series first, InfluxDB keeps the stale and corrected rows in
-    parallel because the tags no longer match.
-    """
-    if INFLUXDB_VERSION != '1':
-        logging.warning(
-            f"InfluxDB version {INFLUXDB_VERSION} does not support purging StrengthExerciseSet series for activity {activity_id}. "
-            "Applying the default refresh behavior; edited exercises may produce duplicated rows."
-        )
-        return True
-
-    if not hasattr(influxdbclient, 'delete_series'):
-        logging.warning(
-            f"InfluxDB client does not support purging StrengthExerciseSet series for activity {activity_id}. "
-            "Applying the default refresh behavior; edited exercises may produce duplicated rows."
-        )
-        return True
-
-    try:
-        influxdbclient.delete_series(
-            measurement='StrengthExerciseSet',
-            tags={'ActivityID': str(activity_id)},
-        )
-        logging.info(f"Purged existing StrengthExerciseSet series for activity {activity_id}")
-        return True
-    except (InfluxDBClientError, InfluxDBError) as err:
-        logging.warning(
-            f"Failed to purge existing StrengthExerciseSet series for activity {activity_id}: {err}"
-        )
-        return False
-
-
-# %%
 def get_strength_training_data(strength_activity_id_dict):
     """Fetch strength training exercise sets and HR zones from Garmin Connect API.
     Uses API data (not FIT files) to get corrected exercise names and details.
@@ -799,11 +803,9 @@ def get_strength_training_data(strength_activity_id_dict):
         activity_selector = activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
         activity_name = activity_info.get('activityName', activity_type)
 
-        exercise_set_points = None
         try:
             exercise_sets_data = garmin_obj.get_activity_exercise_sets(activity_id)
             exercises = exercise_sets_data.get('exerciseSets', []) or []
-            exercise_set_points = []
             set_counter = 0
             for exercise in exercises:
                 set_type = exercise.get('setType', '')
@@ -832,7 +834,7 @@ def get_strength_training_data(strength_activity_id_dict):
                     "Weight_kg": weight_kg,
                     "Duration_s": duration_s,
                 }
-                exercise_set_points.append({
+                points_list.append({
                     "measurement": "StrengthExerciseSet",
                     "time": set_time,
                     "tags": {
@@ -848,14 +850,6 @@ def get_strength_training_data(strength_activity_id_dict):
             logging.info(f"Success : Fetching {set_counter} strength exercise sets for activity {activity_id}")
         except Exception as err:
             logging.warning(f"Failed to fetch exercise sets for activity {activity_id}: {err}")
-
-        if exercise_set_points is not None:
-            if purge_existing_strength_exercise_sets(activity_id):
-                points_list.extend(exercise_set_points)
-            else:
-                logging.warning(
-                    f"Skipped : StrengthExerciseSet refresh for activity {activity_id} because stale rows could not be purged"
-                )
 
         try:
             hr_zones_data = garmin_obj.get_activity_hr_in_timezones(activity_id)
@@ -888,144 +882,6 @@ def get_strength_training_data(strength_activity_id_dict):
     return points_list
 
 # %%
-def _build_cycling_dynamics_point(all_records_list, all_sessions_list, activityID, activity_type, activity_start_time):
-    def avg_nonzero(records, key):
-        vals = [r[key] for r in records if r.get(key) not in (None, 0)]
-        return sum(vals) / len(vals) if vals else None
-
-    def session_phase_component(session, key, index):
-        """Extract one angle from a power phase tuple field; skip None/0 entries."""
-        v = session.get(key)
-        if v is None:
-            return None
-        try:
-            item = v[index] if hasattr(v, '__getitem__') else v
-            return float(item) if item not in (None, 0) else None
-        except (IndexError, TypeError):
-            return None
-
-    def record_phase_avg(records, key, index):
-        """Average one component of a per-record power phase tuple field."""
-        vals = []
-        for r in records:
-            v = r.get(key)
-            if v is None:
-                continue
-            try:
-                item = v[index] if hasattr(v, '__getitem__') else v
-                if item not in (None, 0):
-                    vals.append(item)
-            except (IndexError, TypeError):
-                pass
-        return sum(vals) / len(vals) if vals else None
-
-    fields = {}
-
-    # --- Session-level pre-computed averages (primary source) ---
-    if all_sessions_list:
-        session = all_sessions_list[0]
-
-        # Scalar fields — ANT+ standard
-        for src, dst in [
-            ('avg_left_torque_effectiveness',  'avg_left_torque_effectiveness'),
-            ('avg_right_torque_effectiveness', 'avg_right_torque_effectiveness'),
-            ('avg_left_pedal_smoothness',      'avg_left_pedal_smoothness'),
-            ('avg_right_pedal_smoothness',     'avg_right_pedal_smoothness'),
-            ('avg_left_pco',                   'avg_left_pco'),
-            ('avg_right_pco',                  'avg_right_pco'),
-        ]:
-            v = session.get(src)
-            if v is not None:
-                fields[dst] = float(v)
-
-        # Power phase tuples — Garmin Vector/Rally exclusive
-        # fitparse returns avg_left_power_phase as (start, end, ...) in degrees
-        for field_key, idx, dst in [
-            ('avg_left_power_phase',       0, 'avg_left_power_phase_start'),
-            ('avg_left_power_phase',       1, 'avg_left_power_phase_end'),
-            ('avg_right_power_phase',      0, 'avg_right_power_phase_start'),
-            ('avg_right_power_phase',      1, 'avg_right_power_phase_end'),
-            ('avg_left_power_phase_peak',  0, 'avg_left_power_phase_peak_start'),
-            ('avg_left_power_phase_peak',  1, 'avg_left_power_phase_peak_end'),
-            ('avg_right_power_phase_peak', 0, 'avg_right_power_phase_peak_start'),
-            ('avg_right_power_phase_peak', 1, 'avg_right_power_phase_peak_end'),
-        ]:
-            v = session_phase_component(session, field_key, idx)
-            if v is not None:
-                fields[dst] = v
-
-        # Power summary fields
-        for src, dst in [
-            ('normalized_power',      'normalized_power'),
-            ('training_stress_score', 'training_stress_score'),
-            ('intensity_factor',      'intensity_factor'),
-        ]:
-            v = session.get(src)
-            if v is not None:
-                fields[dst] = float(v)
-
-        # left_right_balance: FIT uint16 bitmask — bit15 set means right% is known,
-        # lower 15 bits / 100 = right power percentage; we store left% for readability.
-        lrb = session.get('left_right_balance')
-        if lrb is not None:
-            try:
-                raw = int(lrb)
-                if raw & 0x8000:
-                    fields['left_right_balance'] = round(100.0 - (raw & 0x7FFF) / 100.0, 2)
-                elif raw > 0:
-                    fields['left_right_balance'] = float(raw)
-            except (ValueError, TypeError):
-                pass
-
-    # --- Per-record fallback (for devices that store dynamics in record messages) ---
-    for src, dst in [
-        ('left_torque_effectiveness',  'avg_left_torque_effectiveness'),
-        ('right_torque_effectiveness', 'avg_right_torque_effectiveness'),
-        ('left_pedal_smoothness',      'avg_left_pedal_smoothness'),
-        ('right_pedal_smoothness',     'avg_right_pedal_smoothness'),
-        ('left_pco',                   'avg_left_pco'),
-        ('right_pco',                  'avg_right_pco'),
-    ]:
-        if dst not in fields:
-            v = avg_nonzero(all_records_list, src)
-            if v is not None:
-                fields[dst] = v
-
-    for field_key, idx, dst in [
-        ('left_power_phase',       0, 'avg_left_power_phase_start'),
-        ('left_power_phase',       1, 'avg_left_power_phase_end'),
-        ('right_power_phase',      0, 'avg_right_power_phase_start'),
-        ('right_power_phase',      1, 'avg_right_power_phase_end'),
-        ('left_power_phase_peak',  0, 'avg_left_power_phase_peak_start'),
-        ('left_power_phase_peak',  1, 'avg_left_power_phase_peak_end'),
-        ('right_power_phase_peak', 0, 'avg_right_power_phase_peak_start'),
-        ('right_power_phase_peak', 1, 'avg_right_power_phase_peak_end'),
-    ]:
-        if dst not in fields:
-            v = record_phase_avg(all_records_list, field_key, idx)
-            if v is not None:
-                fields[dst] = v
-
-    # Guard: write nothing if no cycling dynamics data was found
-    if not fields:
-        return None
-
-    fields['ActivityName'] = activity_type
-    fields['Activity_ID'] = activityID
-
-    return {
-        "measurement": "CyclingDynamics",
-        "time": activity_start_time.isoformat(),
-        "tags": {
-            "Device": GARMIN_DEVICENAME,
-            "Database_Name": INFLUXDB_DATABASE,
-            "ActivityID": activityID,
-            "ActivitySelector": activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
-        },
-        "fields": fields
-    }
-
-# %%
 def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back to TCX
     points_list = []
     for activityID in activityIDdict.keys():
@@ -1052,6 +908,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                     all_sessions_list = [record.get_values() for record in fitfile.get_messages('session')]
                     all_lengths_list = [record.get_values() for record in fitfile.get_messages('length')]
                     all_laps_list = [record.get_values() for record in fitfile.get_messages('lap')]
+                    all_workout_steps_list = [record.get_values() for record in fitfile.get_messages('workout_step')]  # Patch: extraction prescription steps
                     if len(all_records_list) == 0:
                         raise FileNotFoundError(f"No records found in FIT file for Activity ID {activityID} - Discarding FIT file")
                     else:
@@ -1103,7 +960,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "ActivitySelector": activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
                                 },
                                 "fields": {
-                                    "Index": (int(v) if str(v := session_record.get('message_index', -1)).isdigit() else -1) + 1,
+                                    "Index": int(session_record.get('message_index', -1)) + 1,
                                     "ActivityName": activity_type,
                                     "Activity_ID": activityID,
                                     "Sport": str(session_record.get('sport', None)), # Avoid partial write error 400 see #152#issuecomment-3084539416
@@ -1180,20 +1037,388 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Avg_Vertical_Oscillation": lap_record.get('avg_vertical_oscillation', None),
                                     "Avg_Stance_Time": lap_record.get('avg_stance_time', None),
                                     "Avg_Vertical_Ratio": lap_record.get('avg_vertical_ratio', None),
-                                    "Avg_Step_Length": lap_record.get('avg_step_length', None)
+                                    "Avg_Step_Length": lap_record.get('avg_step_length', None),
+                                    # Patch: workout step linkage (None pour activites sans workout structure)
+                                    "Intensity": str(lap_record.get('intensity')) if lap_record.get('intensity') is not None else None,
+                                    "LapTrigger": str(lap_record.get('lap_trigger')) if lap_record.get('lap_trigger') is not None else None,
+                                    "WktStepIndex": int(lap_record['wkt_step_index']) if lap_record.get('wkt_step_index') is not None else None,
                                 }
                             }
                             points_list.append(point)
-                    # Extract cycling dynamics and advanced power metrics
-                    if 'cycling_dynamics' in FETCH_SELECTION:
-                        cycling_point = _build_cycling_dynamics_point(
-                            all_records_list, all_sessions_list,
-                            activityID, activity_type, activity_start_time
-                        )
-                        if cycling_point:
-                            points_list.append(cycling_point)
-                            logging.info(f"Activity ID {activityID}: CyclingDynamics point added ({len(cycling_point['fields']) - 2} metrics)")
+                    # Patch: ecrire WorkoutStep measurement avec la prescription
+                    # de chaque step. Les bornes HR (custom_target_heart_rate_low/high) sont en bpm
+                    # absolu si > 100 (encoding fit-tool). target_hr_zone donne le numero de zone
+                    # tel que prescrit a l'upload. Pour relier au temps de l'activite, on calcule
+                    # step_start_offset_s en cherchant le premier lap avec wkt_step_index matchant.
+                    if all_workout_steps_list:
+                        step_starts_utc = {}
+                        step_ends_utc = {}
+                        for lap_record in all_laps_list:
+                            wsi = lap_record.get('wkt_step_index')
+                            st = lap_record.get('start_time')
+                            et = lap_record.get('total_elapsed_time') or 0
+                            if wsi is None or st is None:
+                                continue
+                            st_utc = st.replace(tzinfo=pytz.UTC)
+                            end_utc = st_utc + timedelta(seconds=et)
+                            if wsi not in step_starts_utc or st_utc < step_starts_utc[wsi]:
+                                step_starts_utc[wsi] = st_utc
+                            if wsi not in step_ends_utc or end_utc > step_ends_utc[wsi]:
+                                step_ends_utc[wsi] = end_utc
+                        for step_record in all_workout_steps_list:
+                            step_idx = step_record.get('message_index')
+                            if step_idx is None:
+                                continue
+                            step_start = step_starts_utc.get(step_idx)
+                            step_end = step_ends_utc.get(step_idx)
+                            # Patch: multi-target (HR / Power / Cadence)
+                            # Garmin Connect re-encode le workout avant download. Selon
+                            # target_type, les bornes peuvent etre dans le field
+                            # specifique (custom_target_heart_rate_low/high) OU dans le
+                            # generique (custom_target_value_low/high). Verifie sur les
+                            # workouts Laurent : pour target_type=power_3s, Garmin met
+                            # les W dans custom_target_value_low/high SANS offset 1000.
+                            target_low_bpm = target_high_bpm = None
+                            target_low_w = target_high_w = None
+                            target_low_rpm = target_high_rpm = None
+                            tt_str = str(step_record.get('target_type') or '')
+                            val_low = step_record.get('custom_target_value_low')
+                            val_high = step_record.get('custom_target_value_high')
+                            if tt_str == 'heart_rate':
+                                hr_low = step_record.get('custom_target_heart_rate_low')
+                                if hr_low is None:
+                                    hr_low = val_low
+                                hr_high = step_record.get('custom_target_heart_rate_high')
+                                if hr_high is None:
+                                    hr_high = val_high
+                                target_low_bpm = int(hr_low) if hr_low is not None and hr_low > 0 else None
+                                target_high_bpm = int(hr_high) if hr_high is not None and hr_high > 0 else None
+                            elif 'power' in tt_str:
+                                pw_low = step_record.get('custom_target_power_low')
+                                if pw_low is None:
+                                    pw_low = val_low
+                                pw_high = step_record.get('custom_target_power_high')
+                                if pw_high is None:
+                                    pw_high = val_high
+                                # Si valeur >= 1000 = encoding offset (W = val - 1000).
+                                # Sinon = W direct (Garmin re-encode comme ca au download).
+                                if pw_low is not None and pw_low > 0:
+                                    target_low_w = int(pw_low - 1000) if pw_low >= 1000 else int(pw_low)
+                                if pw_high is not None and pw_high > 0:
+                                    target_high_w = int(pw_high - 1000) if pw_high >= 1000 else int(pw_high)
+                            elif tt_str == 'cadence':
+                                cad_low = step_record.get('custom_target_cadence_low')
+                                if cad_low is None:
+                                    cad_low = val_low
+                                cad_high = step_record.get('custom_target_cadence_high')
+                                if cad_high is None:
+                                    cad_high = val_high
+                                target_low_rpm = int(cad_low) if cad_low is not None and cad_low > 0 else None
+                                target_high_rpm = int(cad_high) if cad_high is not None and cad_high > 0 else None
+                            duration_value = step_record.get('duration_time')
+                            if duration_value is None:
+                                duration_value = step_record.get('duration_value')
+                            point_time = step_start.isoformat() if step_start else activity_start_time.isoformat()
+                            step_start_offset_s = (step_start - activity_start_time).total_seconds() if step_start else None
+                            step_actual_duration_s = (step_end - step_start).total_seconds() if (step_start and step_end) else None
+                            point = {
+                                "measurement": "WorkoutStep",
+                                "time": point_time,
+                                "tags": {
+                                    "Device": GARMIN_DEVICENAME,
+                                    "Database_Name": INFLUXDB_DATABASE,
+                                    "ActivityID": activityID,
+                                    "ActivitySelector": activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
+                                },
+                                "fields": {
+                                    "ActivityName": activity_type,
+                                    "Activity_ID": activityID,
+                                    "StepIndex": int(step_idx),
+                                    "IntensityType": str(step_record.get('intensity')) if step_record.get('intensity') is not None else None,
+                                    "DurationType": str(step_record.get('duration_type')) if step_record.get('duration_type') is not None else None,
+                                    "DurationValueS": float(duration_value) if duration_value is not None else None,
+                                    "TargetType": str(step_record.get('target_type')) if step_record.get('target_type') is not None else None,
+                                    "TargetHRZone": int(step_record['target_hr_zone']) if step_record.get('target_hr_zone') is not None else None,
+                                    "TargetLowBPM": target_low_bpm,
+                                    "TargetHighBPM": target_high_bpm,
+                                    "TargetPowerZone": int(step_record['target_power_zone']) if step_record.get('target_power_zone') is not None else None,
+                                    "TargetLowW": target_low_w,
+                                    "TargetHighW": target_high_w,
+                                    "TargetLowRPM": target_low_rpm,
+                                    "TargetHighRPM": target_high_rpm,
+                                    "StepStartOffsetS": step_start_offset_s,
+                                    "StepActualDurationS": step_actual_duration_s,
+                                    "Notes": str(step_record.get('notes'))[:500] if step_record.get('notes') else None,
+                                }
+                            }
+                            points_list.append(point)
+                        # Patch: ecrire WorkoutTarget per-seconde pour
+                        # rendering de la bande prescription dans dashboard J. Une row
+                        # par seconde d'activite, avec target_low/high de l'etape active.
+                        # Steps OPEN -> pas de rows (gap automatique en query InfluxDB).
+                        # Permet a Grafana de tracer une bande continue qui s'arrete pile
+                        # aux frontieres OPEN/non-OPEN sans line extension artefact.
+                        # Patch: on garde aussi les OPEN steps avec sentinel
+                        # -1 pour forcer un gap visuel dans le panel HR du dashboard J. Sans
+                        # rows pendant les OPEN, Grafana relie en continu via stepAfter (les
+                        # rows manquantes != NULL, spanNulls ne s'applique pas). Avec axis
+                        # min=90, les rows a -1 sont clippees -> vrai gap visible.
+                        # Patch: multi-target. step_intervals stocke
+                        # un interval PAR LAP (gere les workouts avec repeat : 3x12'
+                        # power -> 3 intervals distincts au lieu d'un seul couvrant le
+                        # span entier). Le decoding de target depuis step_records_by_idx
+                        # (1 step_record par message_index, partage entre repetitions).
+                        # Sentinel -1 par metrique pour gap visuel sur le panel non
+                        # concerne (ex: step power -> hr_low/high a -1).
+                        step_records_by_idx = {sr.get('message_index'): sr for sr in all_workout_steps_list if sr.get('message_index') is not None}
+                        def _decode_step_targets(sr):
+                            """Retourne (hr_low, hr_high, w_low, w_high, rpm_low, rpm_high)
+                            depuis un step_record FIT, en gerant l'ambiguite Garmin
+                            re-encoding (custom_target_value_low/high generique) et
+                            l'offset 1000 pour power (uniquement si valeur >= 1000)."""
+                            if sr is None:
+                                return None, None, None, None, None, None
+                            tt_s = str(sr.get('target_type') or '')
+                            v_low = sr.get('custom_target_value_low')
+                            v_high = sr.get('custom_target_value_high')
+                            if tt_s == 'heart_rate':
+                                lo = sr.get('custom_target_heart_rate_low')
+                                if lo is None: lo = v_low
+                                hi = sr.get('custom_target_heart_rate_high')
+                                if hi is None: hi = v_high
+                                return (int(lo) if lo and lo > 0 else None,
+                                        int(hi) if hi and hi > 0 else None,
+                                        None, None, None, None)
+                            if 'power' in tt_s:
+                                lo = sr.get('custom_target_power_low')
+                                if lo is None: lo = v_low
+                                hi = sr.get('custom_target_power_high')
+                                if hi is None: hi = v_high
+                                w_lo = (int(lo - 1000) if lo >= 1000 else int(lo)) if lo and lo > 0 else None
+                                w_hi = (int(hi - 1000) if hi >= 1000 else int(hi)) if hi and hi > 0 else None
+                                return None, None, w_lo, w_hi, None, None
+                            if tt_s == 'cadence':
+                                lo = sr.get('custom_target_cadence_low')
+                                if lo is None: lo = v_low
+                                hi = sr.get('custom_target_cadence_high')
+                                if hi is None: hi = v_high
+                                return (None, None, None, None,
+                                        int(lo) if lo and lo > 0 else None,
+                                        int(hi) if hi and hi > 0 else None)
+                            return None, None, None, None, None, None
 
+                        # Build intervals : on merge les laps CONSECUTIFS avec le
+                        # meme wkt_step_index en 1 interval. Cela gere :
+                        # - L'auto-lap par distance Garmin qui decoupe un step en
+                        #   plusieurs laps (ex: warmup 20 min decoupe en 12+8 min
+                        #   par auto-lap a 5km). Sans merge, le step warmup avait
+                        #   2 plateaux StepAvgHR differents alors qu'il est UN
+                        #   step logique.
+                        # - Les repetitions de step par repeat_until_steps_cmplt :
+                        #   3x effort 12' donnent 3 occurrences distinctes du
+                        #   meme wsi=2, separees par des laps wsi=3 (recup) ;
+                        #   le merge ne les fusionne PAS car ils ne sont pas
+                        #   consecutifs dans le temps.
+                        sorted_laps = sorted(
+                            (l for l in all_laps_list if l.get('start_time') is not None and l.get('wkt_step_index') is not None),
+                            key=lambda l: l['start_time']
+                        )
+                        step_intervals = []
+                        current = None  # interval en cours d'agregation (laps consecutifs meme wsi)
+                        for lap_record in sorted_laps:
+                            wsi = lap_record.get('wkt_step_index')
+                            st = lap_record.get('start_time')
+                            et = lap_record.get('total_elapsed_time') or 0
+                            if et <= 0:
+                                continue
+                            st_utc = st.replace(tzinfo=pytz.UTC)
+                            end_utc = st_utc + timedelta(seconds=et)
+                            if current is not None and current['_wsi'] == int(wsi):
+                                # Meme wsi consecutif -> on etend l'interval courant
+                                current['end'] = (end_utc - activity_start_time).total_seconds()
+                                continue
+                            # Nouveau wsi (ou premier) -> flush l'ancien si existant
+                            if current is not None:
+                                current.pop('_wsi')
+                                step_intervals.append(current)
+                            sr = step_records_by_idx.get(wsi)
+                            tlow_bpm, thigh_bpm, tlow_w, thigh_w, tlow_rpm, thigh_rpm = _decode_step_targets(sr)
+                            # Patch: on laisse les valeurs None
+                            # quand la metrique n'est pas la cible du step (au
+                            # lieu du sentinel -1 historique). Avec None, le row
+                            # InfluxDB ne stocke pas le field -> apparait NULL
+                            # dans le SELECT cote dashboard -> Grafana brise net
+                            # ligne et fillBelowTo polygon, sans drop visuel
+                            # vers -1 (cas observe sur Target middle qui plongait
+                            # vers -1 quand (-1+-1)/2 etait calcule pendant les
+                            # steps wrong-target). Le RowMarker = 1 (cf. plus
+                            # bas) garantit que la row reste presente dans le
+                            # result set malgre le NULL.
+                            start_off = (st_utc - activity_start_time).total_seconds()
+                            end_off = (end_utc - activity_start_time).total_seconds()
+                            current = {
+                                'start': start_off, 'end': end_off,
+                                'sidx': int(wsi),
+                                'occ_idx': len(step_intervals),  # unique par occurrence (merged)
+                                'hr_low': tlow_bpm, 'hr_high': thigh_bpm,
+                                'pwr_low': tlow_w, 'pwr_high': thigh_w,
+                                'cad_low': tlow_rpm, 'cad_high': thigh_rpm,
+                                '_wsi': int(wsi),  # interne, retire avant append
+                            }
+                        if current is not None:
+                            current.pop('_wsi')
+                            step_intervals.append(current)
+                        if step_intervals:
+                            # Patch: pre-compute moyennes HR/Power/Cadence
+                            # PAR OCCURRENCE (occ_idx unique) : utile pour comparer le 1er
+                            # bloc 12' vs le 3e (degradation effort). Sinon les 3 reps
+                            # auraient la meme moyenne (cas precedent par sidx).
+                            # Patch: 7 metriques accumulees par step :
+                            # hr/pwr/cad (deja existant) + stride/vr/alt/spd (nouveau,
+                            # pour overlays "Moy / step" sur les panels Stride/VR/
+                            # Elevation/Pace du dashboard 03). Pace = 1000/spd cote
+                            # query Grafana (spd stocke en m/s, comme Speed dans
+                            # ActivityGPS). Stride en mm (comme Step_Length), VR en
+                            # %, alt en m. Filtres positifs : meme criteres que les
+                            # extra_filter des panels (skip 0/None pour eviter de
+                            # tirer les means vers le bas pendant warmup walk).
+                            step_metric_acc = {iv['occ_idx']: {
+                                'hr': [0.0, 0], 'pwr': [0.0, 0], 'cad': [0.0, 0],
+                                'stride': [0.0, 0], 'vr': [0.0, 0],
+                                'alt': [0.0, 0], 'spd': [0.0, 0],
+                            } for iv in step_intervals}
+                            for parsed_rec_avg in all_records_list:
+                                ts_rec_avg = parsed_rec_avg.get('timestamp')
+                                if ts_rec_avg is None:
+                                    continue
+                                ts_utc_avg = ts_rec_avg.replace(tzinfo=pytz.UTC)
+                                offset_avg = (ts_utc_avg - activity_start_time).total_seconds()
+                                hr_v = parsed_rec_avg.get('heart_rate')
+                                pwr_v = parsed_rec_avg.get('power')
+                                cad_v = parsed_rec_avg.get('cadence')
+                                stride_v = parsed_rec_avg.get('step_length')
+                                vr_v = parsed_rec_avg.get('vertical_ratio')
+                                alt_v = parsed_rec_avg.get('enhanced_altitude')
+                                if alt_v is None:
+                                    alt_v = parsed_rec_avg.get('altitude')
+                                spd_v = parsed_rec_avg.get('enhanced_speed')
+                                if spd_v is None:
+                                    spd_v = parsed_rec_avg.get('speed')
+                                for iv in step_intervals:
+                                    if iv['start'] <= offset_avg < iv['end']:
+                                        acc = step_metric_acc[iv['occ_idx']]
+                                        if hr_v is not None and hr_v > 0:
+                                            acc['hr'][0] += float(hr_v); acc['hr'][1] += 1
+                                        if pwr_v is not None and pwr_v > 0:
+                                            acc['pwr'][0] += float(pwr_v); acc['pwr'][1] += 1
+                                        if cad_v is not None and cad_v > 0:
+                                            acc['cad'][0] += float(cad_v); acc['cad'][1] += 1
+                                        if stride_v is not None and stride_v > 0:
+                                            acc['stride'][0] += float(stride_v); acc['stride'][1] += 1
+                                        if vr_v is not None and vr_v > 0:
+                                            acc['vr'][0] += float(vr_v); acc['vr'][1] += 1
+                                        if alt_v is not None:
+                                            acc['alt'][0] += float(alt_v); acc['alt'][1] += 1
+                                        # Speed > 0.5 m/s (~7:00/km min walking pace
+                                        # threshold) : evite que les pauses tirent la
+                                        # mean speed vers 0 -> pace mean reflete le
+                                        # vrai mouvement.
+                                        if spd_v is not None and spd_v > 0.5:
+                                            acc['spd'][0] += float(spd_v); acc['spd'][1] += 1
+                                        break
+                            step_avg = {oid: {
+                                k: (a[0] / a[1] if a[1] > 0 else None)
+                                for k, a in acc.items()
+                            } for oid, acc in step_metric_acc.items()}
+                            for parsed_record in all_records_list:
+                                ts_rec = parsed_record.get('timestamp')
+                                if ts_rec is None:
+                                    continue
+                                ts_utc = ts_rec.replace(tzinfo=pytz.UTC)
+                                offset_s = (ts_utc - activity_start_time).total_seconds()
+                                for iv in step_intervals:
+                                    if iv['start'] <= offset_s < iv['end']:
+                                        avgs = step_avg.get(iv['occ_idx'], {})
+                                        # StepAvg* : TOUJOURS la mean reelle du
+                                        # step (peu importe target type). Permet
+                                        # a l'overlay "Moy / step" du dashboard
+                                        # d'afficher la HR moyenne meme pendant
+                                        # un step Power-only (ex: Velo a ~150
+                                        # bpm) -> staircase visuelle continue
+                                        # sur tous les steps du workout, en
+                                        # plus du target prescrit (white band)
+                                        # qui lui n'apparait qu'aux steps right-
+                                        # target.
+                                        avg_hr = float(avgs['hr']) if avgs.get('hr') is not None else None
+                                        avg_pwr = float(avgs['pwr']) if avgs.get('pwr') is not None else None
+                                        avg_cad = float(avgs['cad']) if avgs.get('cad') is not None else None
+                                        avg_stride = float(avgs['stride']) if avgs.get('stride') is not None else None
+                                        avg_vr = float(avgs['vr']) if avgs.get('vr') is not None else None
+                                        avg_alt = float(avgs['alt']) if avgs.get('alt') is not None else None
+                                        avg_spd = float(avgs['spd']) if avgs.get('spd') is not None else None
+                                        wt_point = {
+                                            "measurement": "WorkoutTarget",
+                                            "time": ts_utc.isoformat(),
+                                            "tags": {
+                                                "Device": GARMIN_DEVICENAME,
+                                                "Database_Name": INFLUXDB_DATABASE,
+                                                "ActivityID": activityID,
+                                                "ActivitySelector": activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
+                                            },
+                                            "fields": {
+                                                # Target* : None si la metrique
+                                                # n'est pas la cible du step.
+                                                # Cote dashboard -> NULL dans le
+                                                # SELECT -> Grafana brise net la
+                                                # ligne/le fillBelowTo polygon
+                                                # entre la fin du dernier right-
+                                                # target step et le debut du
+                                                # prochain. Pas besoin de boundary
+                                                # marker first-row : la transition
+                                                # value->None entre 2 rows
+                                                # consecutives suffit.
+                                                "TargetLowBPM": iv['hr_low'],
+                                                "TargetHighBPM": iv['hr_high'],
+                                                "TargetLowW": iv['pwr_low'],
+                                                "TargetHighW": iv['pwr_high'],
+                                                "TargetLowRPM": iv['cad_low'],
+                                                "TargetHighRPM": iv['cad_high'],
+                                                "DurationSeconds": offset_s,
+                                                "StepIndex": iv['sidx'],
+                                                "StepAvgHR": avg_hr,
+                                                "StepAvgPower": avg_pwr,
+                                                "StepAvgCadence": avg_cad,
+                                                # Patch: means par step
+                                                # pour Stride/VR/Altitude/Speed -> overlay
+                                                # "Moy / step" staircase sur les panels
+                                                # correspondants (pas de target band, juste
+                                                # la realisation moyenne par step).
+                                                # Stride en mm (cf. Step_Length ActivityGPS,
+                                                # divise par 1000 cote query pour metres).
+                                                # VR en %. Alt en m. Spd en m/s -> pace =
+                                                # 1000/spd cote query (s/km).
+                                                "StepAvgStride": avg_stride,
+                                                "StepAvgVR": avg_vr,
+                                                "StepAvgAltitude": avg_alt,
+                                                "StepAvgSpeed": avg_spd,
+                                                # RowMarker = 1 sur TOUTES les
+                                                # rows. InfluxDB v1 omet les rows
+                                                # ou TOUS les SELECT fields sont
+                                                # NULL, donc les rows ou seul le
+                                                # Target* est NULL (ex: pendant
+                                                # un step wrong-target) seraient
+                                                # exclues du result set. En
+                                                # SELECTant aussi RowMarker dans
+                                                # la query du dashboard, InfluxDB
+                                                # garde ces rows et reporte NULL
+                                                # pour le Target field principal
+                                                # -> Grafana voit le NULL et
+                                                # brise net ligne / polygon.
+                                                "RowMarker": 1,
+                                            }
+                                        }
+                                        points_list.append(wt_point)
+                                        break
                     if KEEP_FIT_FILES:
                         os.makedirs(FIT_FILE_STORAGE_LOCATION, exist_ok=True)
                         fit_path = os.path.join(FIT_FILE_STORAGE_LOCATION, activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type + ".fit")
@@ -1278,6 +1503,85 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
         PARSED_ACTIVITY_ID_LIST.append(activityID)
     return points_list
 
+def get_zones_definition():
+    """Fetches current HR + Power zones from Garmin. Patch.
+
+    The API returns the CURRENT state only (no history). This function writes 1
+    snapshot per UTC day per sport ; multiple writes within the same day overwrite
+    the same record (same timestamp + tags = upsert).
+
+    Called once per fetch_write_bulk() invocation, NOT per date (zones are not
+    date-keyed - calling per date would just rewrite the same data N times).
+    """
+    points_list = []
+    today_iso = datetime.now(tz=pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    # HR zones - returns list of dicts (one per sport: DEFAULT, RUNNING, etc.)
+    try:
+        hr_data = garmin_obj.connectapi("/biometric-service/heartRateZones")
+        for entry in hr_data or []:
+            sport = entry.get("sport", "DEFAULT")
+            fields = {}
+            if entry.get("trainingMethod") is not None:
+                fields["trainingMethod"] = str(entry["trainingMethod"])
+            for src_key, dst_key in [
+                ("restingHeartRateUsed", "restingHeartRate"),
+                ("lactateThresholdHeartRateUsed", "lactateThresholdHeartRate"),
+                ("maxHeartRateUsed", "maxHeartRate"),
+                ("zone1Floor", "zone1Floor"),
+                ("zone2Floor", "zone2Floor"),
+                ("zone3Floor", "zone3Floor"),
+                ("zone4Floor", "zone4Floor"),
+                ("zone5Floor", "zone5Floor"),
+            ]:
+                v = entry.get(src_key)
+                if v is not None:
+                    fields[dst_key] = float(v)
+            if fields:
+                points_list.append({
+                    "measurement": "HRZones",
+                    "time": today_iso,
+                    "tags": {
+                        "Device": GARMIN_DEVICENAME,
+                        "Database_Name": INFLUXDB_DATABASE,
+                        "sport": sport,
+                    },
+                    "fields": fields,
+                })
+                logging.info(f"Success : Fetching HR zones for sport {sport}")
+    except Exception as e:
+        logging.warning(f"Failed to fetch HR zones: {e}")
+
+    # Power zones - per sport. Try RUNNING (CYCLING endpoint may not exist for this user).
+    for sport in ("RUNNING",):
+        try:
+            pwr_data = garmin_obj.connectapi(f"/biometric-service/powerZones/sport/{sport}")
+            if not pwr_data:
+                continue
+            fields = {}
+            for src_key in ["functionalThresholdPower", "zone1Floor", "zone2Floor",
+                            "zone3Floor", "zone4Floor", "zone5Floor"]:
+                v = pwr_data.get(src_key)
+                if v is not None:
+                    fields[src_key] = float(v)
+            if fields:
+                points_list.append({
+                    "measurement": "PowerZones",
+                    "time": today_iso,
+                    "tags": {
+                        "Device": GARMIN_DEVICENAME,
+                        "Database_Name": INFLUXDB_DATABASE,
+                        "sport": sport,
+                    },
+                    "fields": fields,
+                })
+                logging.info(f"Success : Fetching Power zones for sport {sport}")
+        except Exception as e:
+            logging.warning(f"Failed to fetch Power zones for sport {sport}: {e}")
+
+    return points_list
+
+
 def get_lactate_threshold(date_str):
     points_list = []
     endpoints = {}
@@ -1309,10 +1613,12 @@ def get_training_status(date_str):
     points_list = []
     ts_list_all = garmin_obj.get_training_status(date_str)
     ts_training_data_all = (ts_list_all.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData", {})
+    lb_data_all = (ts_list_all.get("mostRecentTrainingLoadBalance") or {}).get("metricsTrainingLoadBalanceDTOMap", {}) or {}
 
     if ts_training_data_all:
         for device_id, ts_dict in ts_training_data_all.items():
             logging.info(f"Success : Processing Training Status for Device {device_id}")
+            lb_dict = lb_data_all.get(str(device_id)) or {}
             data_fields = {
                 "trainingStatus": ts_dict.get("trainingStatus"),
                 "trainingStatusFeedbackPhrase": ts_dict.get("trainingStatusFeedbackPhrase"),
@@ -1324,6 +1630,16 @@ def get_training_status(date_str):
                 "maxTrainingLoadChronic": (ts_dict.get("acuteTrainingLoadDTO") or {}).get("maxTrainingLoadChronic"),
                 "minTrainingLoadChronic": (ts_dict.get("acuteTrainingLoadDTO") or {}).get("minTrainingLoadChronic"),
                 "dailyAcuteChronicWorkloadRatio": (ts_dict.get("acuteTrainingLoadDTO") or {}).get("dailyAcuteChronicWorkloadRatio"),
+                "monthlyLoadAerobicLow": lb_dict.get("monthlyLoadAerobicLow"),
+                "monthlyLoadAerobicHigh": lb_dict.get("monthlyLoadAerobicHigh"),
+                "monthlyLoadAnaerobic": lb_dict.get("monthlyLoadAnaerobic"),
+                "monthlyLoadAerobicLowTargetMin": float(v) if (v := lb_dict.get("monthlyLoadAerobicLowTargetMin")) is not None else None,
+                "monthlyLoadAerobicLowTargetMax": float(v) if (v := lb_dict.get("monthlyLoadAerobicLowTargetMax")) is not None else None,
+                "monthlyLoadAerobicHighTargetMin": float(v) if (v := lb_dict.get("monthlyLoadAerobicHighTargetMin")) is not None else None,
+                "monthlyLoadAerobicHighTargetMax": float(v) if (v := lb_dict.get("monthlyLoadAerobicHighTargetMax")) is not None else None,
+                "monthlyLoadAnaerobicTargetMin": float(v) if (v := lb_dict.get("monthlyLoadAnaerobicTargetMin")) is not None else None,
+                "monthlyLoadAnaerobicTargetMax": float(v) if (v := lb_dict.get("monthlyLoadAnaerobicTargetMax")) is not None else None,
+                "trainingBalanceFeedbackPhrase": lb_dict.get("trainingBalanceFeedbackPhrase"),
             }
             if ts_dict.get("timestamp") and any(value is not None for value in data_fields.values()):
                 points_list.append({
@@ -1336,6 +1652,32 @@ def get_training_status(date_str):
                     "fields": data_fields
                 })
                 logging.info(f"Success : Fetching Training Status for date {date_str}")
+
+    # --- Heat & Altitude Acclimation (from mostRecentVO2Max in same API response) ---
+    ha_data = (ts_list_all.get('mostRecentVO2Max') or {}).get('heatAltitudeAcclimation')
+    if ha_data and ha_data.get('calendarDate'):
+        ha_fields = {
+            'heatAcclimationPercentage': ha_data.get('heatAcclimationPercentage'),
+            'previousHeatAcclimationPercentage': ha_data.get('previousHeatAcclimationPercentage'),
+            'heatTrend': ha_data.get('heatTrend'),
+            'altitudeAcclimation': ha_data.get('altitudeAcclimation'),
+            'previousAltitudeAcclimation': ha_data.get('previousAltitudeAcclimation'),
+            'altitudeTrend': ha_data.get('altitudeTrend'),
+            'currentAltitude': ha_data.get('currentAltitude'),
+            'acclimationPercentage': ha_data.get('acclimationPercentage'),
+        }
+        if any(v is not None for v in ha_fields.values()):
+            points_list.append({
+                'measurement': 'HeatAltitudeAcclimation',
+                'time': datetime.strptime(ha_data['calendarDate'], '%Y-%m-%d').replace(hour=0, tzinfo=pytz.UTC).isoformat(),
+                'tags': {
+                    'Device': GARMIN_DEVICENAME,
+                    'Database_Name': INFLUXDB_DATABASE
+                },
+                'fields': ha_fields
+            })
+            logging.info(f'Success : Fetching Heat/Altitude Acclimation for date {date_str}')
+
     return points_list
 
 # Contribution from PR #17 by @arturgoms 
@@ -1695,6 +2037,12 @@ def fetch_write_bulk(start_date_str, end_date_str):
     logging.info("Fetching data for the given period in reverse chronological order")
     time.sleep(3)
     write_points_to_influxdb(get_last_sync())
+    # Zones HR + Power : snapshot 1x par cycle (API ne renvoie que l'etat courant)
+    if 'zones' in FETCH_SELECTION:
+        try:
+            write_points_to_influxdb(get_zones_definition())
+        except Exception as e:
+            logging.warning(f"Zones snapshot failed: {e}")
     for current_date in iter_days(start_date_str, end_date_str):
         repeat_loop = True
         while repeat_loop:
