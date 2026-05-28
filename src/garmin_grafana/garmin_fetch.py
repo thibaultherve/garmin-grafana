@@ -715,6 +715,7 @@ def get_activity_summary(date_str):
                     "start_time_utc": datetime.strptime(activity["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC).isoformat(),
                     "lat": float(_start_lat),
                     "lon": float(_start_lon),
+                    "duration_s": float(activity.get('duration') or activity.get('elapsedDuration') or activity.get('movingDuration') or 0),
                 })
         # Collect strength training activities for API-based exercise set fetching
         if 'strength' in activity_type_key.lower() and activity.get('startTimeGMT'):
@@ -908,15 +909,64 @@ def _compute_wbgt(temp_c, humidity_pct):
     return round(0.567 * temp_c + 0.393 * e + 3.94, 1)
 
 
+_OPEN_METEO_FIELD_MAP = {
+    "temperature_c": "temperature_2m",
+    "humidity_pct": "relative_humidity_2m",
+    "dew_point_c": "dew_point_2m",
+    "apparent_temp_c": "apparent_temperature",
+    "wind_speed_kmh": "wind_speed_10m",
+    "wind_gust_kmh": "wind_gusts_10m",
+    "wind_direction_deg": "wind_direction_10m",
+    "precipitation_mm": "precipitation",
+    "cloud_cover_pct": "cloud_cover",
+    "pressure_hpa": "pressure_msl",
+    "solar_radiation_wm2": "shortwave_radiation",
+}
+
+
+def _extract_weather_at(hourly, hour_str, prefix=""):
+    """Extract weather fields for one hourly slot, falling back to the closest
+    available hour. Returns {prefix+field: value}, including a WBGT estimate."""
+    times = hourly.get("time", [])
+    if not times:
+        return {}
+    if hour_str in times:
+        idx = times.index(hour_str)
+    else:
+        idx = next((i for i, t in enumerate(times) if t >= hour_str), len(times) - 1)
+
+    def _val(api_key):
+        arr = hourly.get(api_key, [])
+        return float(arr[idx]) if idx < len(arr) and arr[idx] is not None else None
+
+    fields = {}
+    for field_name, api_key in _OPEN_METEO_FIELD_MAP.items():
+        v = _val(api_key)
+        if v is not None:
+            fields[prefix + field_name] = v
+
+    temp = _val("temperature_2m")
+    humidity = _val("relative_humidity_2m")
+    if temp is not None and humidity is not None:
+        fields[prefix + "wbgt_estimated"] = float(_compute_wbgt(temp, humidity))
+
+    return fields
+
+
 def fetch_activity_weather(activity_info_list):
     """
-    Fetch weather from Open-Meteo for each outdoor activity and return InfluxDB points.
+    Fetch start/mid/end weather from Open-Meteo for each outdoor activity and
+    return InfluxDB points.
+
+    Same location (activity start) sampled at three times: start, mid
+    (start + duration/2) and end (start + duration). Mid/end fields are
+    prefixed ``mid_`` / ``end_``; start fields are unprefixed.
 
     Parameters
     ----------
     activity_info_list : list of dict
         Each dict has: selector (ActivitySelector tag), start_time_utc (ISO str),
-        lat (float), lon (float).
+        lat (float), lon (float), duration_s (float).
 
     Returns
     -------
@@ -939,15 +989,16 @@ def fetch_activity_weather(activity_info_list):
             logging.warning(f"Weather: bad timestamp for {selector}: {start_iso}")
             continue
 
-        date_str = start_dt.strftime("%Y-%m-%d")
-        hour_str = start_dt.strftime("%Y-%m-%dT%H:00")
+        dur_s = info.get("duration_s") or 3600
+        mid_dt = start_dt + timedelta(seconds=dur_s / 2)
+        end_dt = start_dt + timedelta(seconds=dur_s)
 
         try:
             resp = requests.get(OPEN_METEO_URL, params={
                 "latitude": round(lat, 4),
                 "longitude": round(lon, 4),
-                "start_date": date_str,
-                "end_date": date_str,
+                "start_date": start_dt.strftime("%Y-%m-%d"),
+                "end_date": end_dt.strftime("%Y-%m-%d"),
                 "hourly": OPEN_METEO_HOURLY_VARS,
                 "timezone": "UTC",
             }, timeout=30)
@@ -958,43 +1009,16 @@ def fetch_activity_weather(activity_info_list):
             continue
 
         hourly = weather.get("hourly", {})
-        times = hourly.get("time", [])
-        idx = times.index(hour_str) if hour_str in times else 0 if times else None
-        if idx is None:
+        fields = {}
+        fields.update(_extract_weather_at(hourly, start_dt.strftime("%Y-%m-%dT%H:00"), ""))
+        fields.update(_extract_weather_at(hourly, mid_dt.strftime("%Y-%m-%dT%H:00"), "mid_"))
+        fields.update(_extract_weather_at(hourly, end_dt.strftime("%Y-%m-%dT%H:00"), "end_"))
+
+        if not fields:
             logging.warning(f"Weather: no hourly data for {selector}")
             continue
 
-        def _val(key):
-            arr = hourly.get(key, [])
-            return float(arr[idx]) if idx < len(arr) and arr[idx] is not None else None
-
-        temp = _val("temperature_2m")
-        humidity = _val("relative_humidity_2m")
-
-        fields = {}
-        field_map = {
-            "temperature_c": "temperature_2m",
-            "humidity_pct": "relative_humidity_2m",
-            "dew_point_c": "dew_point_2m",
-            "apparent_temp_c": "apparent_temperature",
-            "wind_speed_kmh": "wind_speed_10m",
-            "wind_gust_kmh": "wind_gusts_10m",
-            "wind_direction_deg": "wind_direction_10m",
-            "precipitation_mm": "precipitation",
-            "cloud_cover_pct": "cloud_cover",
-            "pressure_hpa": "pressure_msl",
-            "solar_radiation_wm2": "shortwave_radiation",
-        }
-        for field_name, api_key in field_map.items():
-            v = _val(api_key)
-            if v is not None:
-                fields[field_name] = v
-
-        if temp is not None and humidity is not None:
-            fields["wbgt_estimated"] = float(_compute_wbgt(temp, humidity))
-
-        if not fields:
-            continue
+        fields["duration_min"] = round(dur_s / 60.0, 1)
 
         points_list.append({
             "measurement": "ActivityWeather",
@@ -1006,7 +1030,10 @@ def fetch_activity_weather(activity_info_list):
             },
             "fields": fields,
         })
-        logging.info(f"Weather: {selector} -> {temp}°C, {humidity}% humidity, WBGT {fields.get('wbgt_estimated', '?')}")
+        logging.info(
+            f"Weather: {selector} -> {fields.get('temperature_c', '?')}°C start -> "
+            f"{fields.get('end_temperature_c', '?')}°C end (WBGT {fields.get('wbgt_estimated', '?')})"
+        )
 
     return points_list
 
