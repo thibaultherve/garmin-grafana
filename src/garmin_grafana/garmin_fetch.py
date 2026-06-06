@@ -71,6 +71,12 @@ FORCE_REPROCESS_ACTIVITIES = False if os.getenv("FORCE_REPROCESS_ACTIVITIES") in
 USER_TIMEZONE = os.getenv("USER_TIMEZONE", "") # optional, fetches timezone info from last activity automatically if left blank
 PARSED_ACTIVITY_ID_LIST = []
 IGNORE_ERRORS = True if os.getenv("IGNORE_ERRORS") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False
+# Patch: enrichissement surface/type-de-voie via map-matching Valhalla (trace_attributes).
+# Desactive par defaut : on ne l'active qu'apres que les tuiles Valhalla sont construites.
+ENRICH_SURFACE_VALHALLA = True if os.getenv("ENRICH_SURFACE_VALHALLA") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False
+VALHALLA_URL = os.getenv("VALHALLA_URL", "http://valhalla:8002")
+# Sports a pied pour lesquels surface/pente ont du sens (sous-chaine, insensible casse).
+SURFACE_ENRICH_SPORTS = ('running', 'trail', 'walking', 'hiking', 'cycling', 'biking')
 
 # %%
 for handler in logging.root.handlers[:]:
@@ -1038,6 +1044,159 @@ def fetch_activity_weather(activity_info_list):
     return points_list
 
 
+# Patch: helpers + enrichissement surface/pente via Valhalla map-matching
+def _hav_m(lat1, lon1, lat2, lon2):
+    import math
+    R = 6371000.0
+    p1 = math.radians(lat1); p2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1); dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlam/2)**2
+    return 2*R*math.asin(math.sqrt(a))
+
+def _steep_class(s):
+    if s < -8: return '<-8%'
+    if s < -5: return '-8_-5%'
+    if s < -2: return '-5_-2%'
+    if s < 2:  return '-2_2%'
+    if s < 5:  return '2_5%'
+    if s < 8:  return '5_8%'
+    if s < 12: return '8_12%'
+    return '>12%'
+
+def enrich_activity_surface(activityID, activity_type, activity_start_time, all_records_list):
+    """Map-matche la trace GPS de l'activite sur OSM via Valhalla /trace_attributes et
+    renvoie des points InfluxDB ActivitySurface (surface + type-de-voie par segment) et
+    ActivityGrade (pente moyenne par bin de 100 m). NON-FATAL : toute erreur renvoie []
+    (avec warning) — l'ecriture ActivityGPS ne doit jamais etre cassee par l'enrichissement."""
+    if not any(s in (activity_type or '').lower() for s in SURFACE_ENRICH_SPORTS):
+        return []
+    # 1) Trace (lat, lon, alt) depuis les records geolocalises
+    lat = []; lon = []; alt = []
+    for r in all_records_list:
+        if r.get('position_lat') is None or r.get('position_long') is None:
+            continue
+        lat.append(int(r['position_lat']) * (180 / 2**31))
+        lon.append(int(r['position_long']) * (180 / 2**31))
+        alt.append(r.get('enhanced_altitude', None) or r.get('altitude', None))
+    n = len(lat)
+    if n < 20:
+        return []
+    cum = [0.0] * n
+    for i in range(1, n):
+        cum[i] = cum[i-1] + _hav_m(lat[i-1], lon[i-1], lat[i], lon[i])
+    total_m = cum[-1]
+    if total_m < 200:
+        return []
+    # 2) Downsample : 1 point ~ tous les 15 m, max ~2000 (suffisant pour le map-matching)
+    target_step = max(15.0, total_m / 2000.0)
+    shape = []; next_d = 0.0
+    for i in range(n):
+        if cum[i] >= next_d or i == n-1:
+            shape.append({"lat": round(lat[i], 6), "lon": round(lon[i], 6)})
+            next_d = cum[i] + target_step
+    if len(shape) < 10:
+        return []
+    # 3) Valhalla trace_attributes (map_snap)
+    body = {
+        "shape": shape, "costing": "pedestrian", "shape_match": "map_snap",
+        "filters": {"attributes": ["edge.surface", "edge.use", "edge.road_class", "edge.length"],
+                    "action": "include"},
+    }
+    try:
+        resp = requests.post(VALHALLA_URL.rstrip('/') + "/trace_attributes", json=body, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as err:
+        logging.warning(f"Valhalla trace_attributes failed for activity {activityID}: {err}")
+        return []
+    edges = data.get('edges', [])
+    if not edges:
+        logging.warning(f"Valhalla returned no edges for activity {activityID}")
+        return []
+    # 4) Segments surface/waytype le long de la distance (fusion des edges consecutifs egaux),
+    #    edge.length en km, rescale sur la distance GPS reelle pour aligner l'axe distance.
+    val_total_m = sum(e.get('length', 0.0) for e in edges) * 1000.0
+    scale = (total_m / val_total_m) if val_total_m > 0 else 1.0
+    segments = []; d = 0.0
+    for e in edges:
+        seg_len = e.get('length', 0.0) * 1000.0 * scale
+        surf = str(e.get('surface', 'unknown')); use = str(e.get('use', 'unknown'))
+        rclass = str(e.get('road_class', 'unknown'))
+        start = d; end = d + seg_len; d = end
+        if segments and segments[-1]['surface'] == surf and segments[-1]['waytype'] == use:
+            segments[-1]['end_m'] = end
+        else:
+            segments.append({'start_m': start, 'end_m': end, 'surface': surf,
+                             'waytype': use, 'road_class': rclass})
+    sel = activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
+    points = []
+    for seg in segments:
+        points.append({
+            "measurement": "ActivitySurface",
+            "time": (activity_start_time + timedelta(seconds=seg['start_m'])).isoformat(),
+            "tags": {"Device": GARMIN_DEVICENAME, "Database_Name": INFLUXDB_DATABASE,
+                     "ActivityID": activityID, "ActivitySelector": sel,
+                     "surface": seg['surface'], "waytype": seg['waytype']},
+            "fields": {"ActivityName": activity_type, "Activity_ID": activityID,
+                       "start_m": round(seg['start_m'], 1), "end_m": round(seg['end_m'], 1),
+                       "length_m": round(seg['end_m'] - seg['start_m'], 1),
+                       "road_class": seg['road_class']},
+        })
+    # 5) ActivityGrade : pente moyenne par bin de 100 m (depuis alt + distance GPS), passe unique
+    BIN = 100.0; bins = {}
+    for i in range(n):
+        b = int(cum[i] // BIN)
+        if b not in bins: bins[b] = [i, i]
+        else: bins[b][1] = i
+    n_grade = 0
+    for b in sorted(bins):
+        i_lo, i_hi = bins[b]
+        if i_hi <= i_lo or alt[i_lo] is None or alt[i_hi] is None:
+            continue
+        dx = cum[i_hi] - cum[i_lo]
+        if dx <= 0:
+            continue
+        slope = 100.0 * (alt[i_hi] - alt[i_lo]) / dx
+        points.append({
+            "measurement": "ActivityGrade",
+            "time": (activity_start_time + timedelta(seconds=b*BIN)).isoformat(),
+            "tags": {"Device": GARMIN_DEVICENAME, "Database_Name": INFLUXDB_DATABASE,
+                     "ActivityID": activityID, "ActivitySelector": sel,
+                     "steepness_class": _steep_class(slope)},
+            "fields": {"ActivityName": activity_type, "Activity_ID": activityID,
+                       "distance_m": round(b*BIN, 1), "elev_m": round(float(alt[i_lo]), 1),
+                       "avg_slope_pct": round(slope, 1)},
+        })
+        n_grade += 1
+    # ActivityTrack : points GPS downsamples + surface, pour la carte coloree par surface
+    SURF_ID = {'paved_smooth': 0, 'paved': 0, 'paved_rough': 1, 'compacted': 2,
+               'gravel': 3, 'fine_gravel': 3, 'dirt': 4, 'ground': 4, 'path': 5}
+    seg_ptr = 0
+    n_track = 0
+    if segments:
+        tstep = max(20.0, total_m / 600.0)
+        nextd = 0.0
+        for i in range(n):
+            if cum[i] >= nextd or i == n - 1:
+                while seg_ptr < len(segments) - 1 and cum[i] > segments[seg_ptr]['end_m']:
+                    seg_ptr += 1
+                surf = segments[seg_ptr]['surface']
+                points.append({
+                    "measurement": "ActivityTrack",
+                    "time": (activity_start_time + timedelta(seconds=cum[i])).isoformat(),
+                    "tags": {"Device": GARMIN_DEVICENAME, "Database_Name": INFLUXDB_DATABASE,
+                             "ActivityID": activityID, "ActivitySelector": sel},
+                    "fields": {"ActivityName": activity_type, "Activity_ID": activityID,
+                               "Latitude": lat[i], "Longitude": lon[i],
+                               "Surface": surf, "Waytype": segments[seg_ptr]['waytype'],
+                               "surf_id": SURF_ID.get(surf, 6), "distance_m": round(cum[i], 1)},
+                })
+                n_track += 1
+                nextd = cum[i] + tstep
+    logging.info(f"Surface enrichment activity {activityID}: {len(segments)} surface segments, "
+                 f"{n_grade} grade bins (GPS {total_m:.0f}m / Valhalla {val_total_m:.0f}m, scale {scale:.3f})")
+    return points
+
 def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back to TCX
     points_list = []
     for activityID in activityIDdict.keys():
@@ -1104,6 +1263,13 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                 }
                             }
                             points_list.append(point)
+                    # Patch: enrichissement surface/pente via Valhalla (non-fatal, gate par env)
+                    if ENRICH_SURFACE_VALHALLA:
+                        try:
+                            points_list += enrich_activity_surface(
+                                activityID, activity_type, activity_start_time, all_records_list)
+                        except Exception as _enr_err:
+                            logging.warning(f"Surface enrichment skipped for activity {activityID}: {_enr_err}")
                     for session_record in all_sessions_list:
                         if session_record.get('start_time') or session_record.get('timestamp'):
                             point = {
