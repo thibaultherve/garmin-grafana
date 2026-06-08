@@ -909,10 +909,28 @@ OPEN_METEO_HOURLY_VARS = "temperature_2m,relative_humidity_2m,dew_point_2m,appar
 
 import math as _math
 
-def _compute_wbgt(temp_c, humidity_pct):
-    """Simplified outdoor WBGT estimate (Liljegren approximation, no globe thermometer)."""
-    e = (humidity_pct / 100.0) * 6.105 * _math.exp(17.27 * temp_c / (237.7 + temp_c))
-    return round(0.567 * temp_c + 0.393 * e + 3.94, 1)
+def _compute_wbgt(temp_c, humidity_pct, solar_wm2=None, wind_kmh=None):
+    """Outdoor WBGT estimate: Stull (2011) psychrometric wet-bulb + a bounded
+    solar/wind globe term.
+
+    Replaces the old Australian-BoM full-sun formula (0.567*Ta + 0.393*e + 3.94),
+    whose +3.94 C constant assumed full sun and overestimated WBGT by ~4 C in
+    cool/overcast conditions -- it could even exceed the air temperature, which is
+    physically impossible in shade. The shade base (0.7*Tw + 0.3*Ta) is always
+    <= Ta; the solar term adds up to ~3-4 C in strong sun, damped by wind.
+
+    solar_wm2 = shortwave radiation (W/m2) and wind_kmh = wind speed are already
+    fetched from Open-Meteo; when absent the result degrades to a pure shade WBGT.
+    """
+    rh = max(1.0, min(100.0, humidity_pct))
+    # Stull (2011) psychrometric wet-bulb (valid ~ -20..50 C, 5..99 % RH)
+    tw = (temp_c * _math.atan(0.151977 * _math.sqrt(rh + 8.313659))
+          + _math.atan(temp_c + rh) - _math.atan(rh - 1.676331)
+          + 0.00391838 * rh ** 1.5 * _math.atan(0.023101 * rh) - 4.686035)
+    solar = solar_wm2 if solar_wm2 is not None else 0.0
+    wind_ms = (wind_kmh or 0.0) / 3.6
+    solar_bump = min(4.0, 0.0045 * solar) / (1.0 + 0.30 * wind_ms)
+    return round(0.7 * tw + 0.3 * temp_c + solar_bump, 1)
 
 
 _OPEN_METEO_FIELD_MAP = {
@@ -954,7 +972,8 @@ def _extract_weather_at(hourly, hour_str, prefix=""):
     temp = _val("temperature_2m")
     humidity = _val("relative_humidity_2m")
     if temp is not None and humidity is not None:
-        fields[prefix + "wbgt_estimated"] = float(_compute_wbgt(temp, humidity))
+        fields[prefix + "wbgt_estimated"] = float(_compute_wbgt(
+            temp, humidity, _val("shortwave_radiation"), _val("wind_speed_10m")))
 
     return fields
 
