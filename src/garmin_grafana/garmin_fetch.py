@@ -563,7 +563,10 @@ def get_intraday_stress(date_str):
     points_list = []
     stress_list = garmin_obj.get_stress_data(date_str).get('stressValuesArray') or []
     for entry in stress_list:
-        if entry[1] or entry[1] == 0:
+        # Patch B5: Garmin uses negative sentinels (-1 off-wrist, -2 during activity)
+        # for "no measurement"; -1/-2 are truthy so the old `or`/`== 0` gate stored them
+        # as real stress (~12% of points, biasing means low). Keep legit 0, drop None/neg.
+        if entry[1] is not None and entry[1] >= 0:
             points_list.append({
                     "measurement":  "StressIntraday",
                     "time": datetime.fromtimestamp(entry[0]/1000, tz=pytz.timezone("UTC")).isoformat(),
@@ -732,7 +735,15 @@ def get_activity_summary(date_str):
             }
         if "startTimeGMT" in activity: # "startTimeGMT" should be available for all activities (fix #13)
             activity_id = activity.get('activityId')
-            hr_zones_data = garmin_obj.get_activity_hr_in_timezones(activity_id)
+            # Patch B12: get_activity_hr_in_timezones is not implemented by the
+            # GarminBulkExport shim (bulk importer) -> raises AttributeError and aborts
+            # the whole bulk run / drops every activity. Guard so the bulk-import path and
+            # any future API gap degrade to empty HR zones instead of crashing.
+            try:
+                hr_zones_data = garmin_obj.get_activity_hr_in_timezones(activity_id)
+            except Exception as _hrz_err:
+                logging.warning(f"HR-in-zones unavailable for activity {activity_id}: {_hrz_err}")
+                hr_zones_data = None
             hr_zone_boundaries = [None] * 5
             if hr_zones_data:
                 for zone in hr_zones_data:
@@ -789,7 +800,7 @@ def get_activity_summary(date_str):
             })
             points_list.append({
                 "measurement":  "ActivitySummary",
-                "time": (datetime.strptime(activity["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC) + timedelta(seconds=int(activity.get('elapsedDuration', activity.get('duration', 0))))).isoformat(),
+                "time": (datetime.strptime(activity["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC) + timedelta(seconds=int(activity.get('elapsedDuration') or activity.get('duration') or 0))).isoformat(),  # Patch B4: dict.get default does NOT catch explicit null elapsedDuration -> int(None) crash; use `or` fallback chain
                 "tags": {
                     "Device": GARMIN_DEVICENAME,
                     "Database_Name": INFLUXDB_DATABASE,
@@ -1136,18 +1147,40 @@ def enrich_activity_surface(activityID, activity_type, activity_start_time, all_
     #    edge.length en km, rescale sur la distance GPS reelle pour aligner l'axe distance.
     val_total_m = sum(e.get('length', 0.0) for e in edges) * 1000.0
     scale = (total_m / val_total_m) if val_total_m > 0 else 1.0
+    # Patch B3: reject implausible map-matches. When Valhalla's matched path length
+    # deviates >~40% from the GPS track the match is broken (off-OSM section routed
+    # around via the road network) and the uniform rescale would write a fully wrong
+    # surface distribution. Then skip surface+track (leave segments empty) but still
+    # emit ActivityGrade, which is GPS altitude/distance based and unaffected.
+    surface_reliable = (0.6 <= scale <= 1.4)
+    if not surface_reliable:
+        logging.warning(f"Valhalla map-match implausible for activity {activityID} "
+                        f"(GPS {total_m:.0f}m vs Valhalla {val_total_m:.0f}m, scale {scale:.3f}) "
+                        f"- skipping surface/track, keeping grade")
     segments = []; d = 0.0
-    for e in edges:
-        seg_len = e.get('length', 0.0) * 1000.0 * scale
-        surf = str(e.get('surface', 'unknown')); use = str(e.get('use', 'unknown'))
-        rclass = str(e.get('road_class', 'unknown'))
-        start = d; end = d + seg_len; d = end
-        if segments and segments[-1]['surface'] == surf and segments[-1]['waytype'] == use:
-            segments[-1]['end_m'] = end
-        else:
-            segments.append({'start_m': start, 'end_m': end, 'surface': surf,
-                             'waytype': use, 'road_class': rclass})
+    if surface_reliable:
+        for e in edges:
+            seg_len = e.get('length', 0.0) * 1000.0 * scale
+            surf = str(e.get('surface', 'unknown')); use = str(e.get('use', 'unknown'))
+            rclass = str(e.get('road_class', 'unknown'))
+            start = d; end = d + seg_len; d = end
+            if segments and segments[-1]['surface'] == surf and segments[-1]['waytype'] == use:
+                segments[-1]['end_m'] = end
+            else:
+                segments.append({'start_m': start, 'end_m': end, 'surface': surf,
+                                 'waytype': use, 'road_class': rclass})
     sel = activity_start_time.strftime('%Y%m%dT%H%M%SUTC-') + activity_type
+    # Patch B11: purge any prior enrichment series for this activity before re-writing.
+    # Re-enrichment is append-only and the Device tag can flap ('' vs device name), so
+    # without delete-before-write the same activity accumulates duplicate
+    # ActivitySurface/ActivityGrade/ActivityTrack series (observed 2x in prod). Scoped to
+    # this exact ActivitySelector; non-fatal; InfluxDB v1 only.
+    if INFLUXDB_VERSION == '1':
+        try:
+            for _meas in ("ActivitySurface", "ActivityGrade", "ActivityTrack"):
+                influxdbclient.query(f'DELETE FROM "{_meas}" WHERE "ActivitySelector" = \'{sel}\'', method="POST")
+        except Exception as _purge_err:
+            logging.warning(f"Enrichment purge failed for {sel}: {_purge_err}")
     points = []
     for seg in segments:
         points.append({
@@ -1222,7 +1255,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
         activity_type = activityIDdict[activityID]
         if (activityID in PARSED_ACTIVITY_ID_LIST) and (not FORCE_REPROCESS_ACTIVITIES):
             logging.info(f"Skipping : Activity ID {activityID} has already been processed within current runtime")
-            return []
+            continue  # Patch B8: skip this activity only (was return [], which discarded ALL other activities' already-parsed points for the day)
         if (activityID in PARSED_ACTIVITY_ID_LIST) and (FORCE_REPROCESS_ACTIVITIES):
             logging.info(f"Re-processing : Activity ID {activityID} (FORCE_REPROCESS_ACTIVITIES is on)")
         try:
@@ -1263,11 +1296,11 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Activity_ID": activityID,
                                     "Latitude": int(parsed_record['position_lat']) * ( 180 / 2**31 ) if parsed_record.get('position_lat') else None,
                                     "Longitude": int(parsed_record['position_long']) * ( 180 / 2**31 ) if parsed_record.get('position_long') else None,
-                                    "Altitude": parsed_record.get('enhanced_altitude', None) or parsed_record.get('altitude', None),
+                                    "Altitude": parsed_record.get('enhanced_altitude') if parsed_record.get('enhanced_altitude') is not None else parsed_record.get('altitude', None),  # Patch B6: keep 0.0 (was dropped to NULL by falsy or)
                                     "Distance": parsed_record.get('distance', None),
                                     "DurationSeconds": (parsed_record['timestamp'].replace(tzinfo=pytz.UTC) - activity_start_time).total_seconds(),
                                     "HeartRate": float(parsed_record.get('heart_rate', None)) if parsed_record.get('heart_rate', None) else None,
-                                    "Speed": parsed_record.get('enhanced_speed', None) or parsed_record.get('speed', None),
+                                    "Speed": parsed_record.get('enhanced_speed') if parsed_record.get('enhanced_speed') is not None else parsed_record.get('speed', None),  # Patch B6: 0.0 m/s standstill was dropped to NULL by falsy or, biasing mean speed / time-stopped panels
                                     "GradeAdjustedSpeed": (parsed_record.get("unknown_140") / 1000.0) if parsed_record.get("unknown_140") else None,
                                     "RunningEfficiency": ((parsed_record.get("unknown_140") / 1000.0)/parsed_record.get('heart_rate')) if (parsed_record.get("unknown_140") and parsed_record.get('heart_rate')) else None,
                                     "Cadence": parsed_record.get('cadence', None),
@@ -1412,6 +1445,14 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                 continue
                             step_start = step_starts_utc.get(step_idx)
                             step_end = step_ends_utc.get(step_idx)
+                            # Patch B1: steps never executed by any lap (notably the
+                            # repeat_until_steps_cmplt controller, never referenced by a
+                            # lap's wkt_step_index) used to fall back to activity_start_time,
+                            # colliding with the warmup row at the same series+timestamp
+                            # (StepIndex is a field, not a tag) and destroying it via
+                            # InfluxDB last-write-wins. Skip phantom (never-executed) steps.
+                            if step_start is None:
+                                continue
                             # Patch: multi-target (HR / Power / Cadence)
                             # Garmin Connect re-encode le workout avant download. Selon
                             # target_type, les bornes peuvent etre dans le field
@@ -1783,10 +1824,10 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                     logging.info(f"Success : Activity ID {activityID} stored in output file {tcx_path}")
             except requests.exceptions.Timeout as err:
                 logging.warning(f"Request timeout for fetching large activity record {activityID} - skipping record")
-                return []
+                continue  # Patch B8: skip this activity only, keep the day's other activities (was return [])
             except Exception as err:
                 logging.exception(f"Unable to fetch TCX for activity record {activityID} : skipping record")
-                return []
+                continue  # Patch B8: skip this activity only, keep the day's other activities (was return [])
 
             for activity in root.findall("tcx:Activities/tcx:Activity", ns):
                 activity_start_time = datetime.fromisoformat(activity.find("tcx:Id", ns).text.strip("Z"))
